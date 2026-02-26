@@ -1,0 +1,20 @@
+# ==========================================================================
+# CRE PROJECT SETTINGS FILE
+# ==========================================================================
+# Project-specific settings for CRE CLI targets.
+# Each target defines cre-cli, account, and rpcs groups.
+
+local-simulation:
+  rpcs:
+    - chain-name: ethereum-testnet-sepolia
+      url: https://0xrpc.io/sep
+
+staging:
+  cre-cli:
+    don-family: "zone-a"
+  account:
+    workflow-owner-address: "(optional) Multi-signature contract address"
+  rpcs:
+    - chain-name: ethereum-testnet-sepolia
+      url: <select your own rpc url>
+

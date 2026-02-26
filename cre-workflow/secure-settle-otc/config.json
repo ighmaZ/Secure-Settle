@@ -1,0 +1,70 @@
+{
+  "workflowId": "secure-settle-otc",
+  "evms": [
+    {
+      "chainId": 11155111,
+      "chainName": "sepolia",
+      "rpcUrlEnv": "CHAINLINK_RPC_URL",
+      "settlementContractAddress": null,
+      "gasLimit": 400000
+    }
+  ],
+  "matching": {
+    "priceToleranceBps": 100,
+    "proposalExpiryMinutes": 60,
+    "scanIntervalSeconds": 30,
+    "allowPartialFills": false
+  },
+  "compliance": {
+    "amlVolumeThreshold": 1000000,
+    "sanctionsSourceMode": "mock",
+    "sanctionedWallets": [
+      "0x000000000000000000000000000000000000bad0"
+    ]
+  },
+  "convergence": {
+    "baseUrl": "https://convergence2026-token-api.cldev.cloud",
+    "authMode": "eip712",
+    "mode": "stub",
+    "timeoutMs": 5000
+  },
+  "confidentialCompute": {
+    "mode": "stub",
+    "endpointUrl": null,
+    "timeoutMs": 5000,
+    "authHeaderSecretName": null
+  },
+  "proposalEncryption": {
+    "mode": "aes-gcm",
+    "keyId": "dev-proposal-key-v1",
+    "masterKeyHex": null,
+    "masterKeySecretName": "secure-settle-proposal-encryption-key",
+    "devFallbackMasterKeyHex": null
+  },
+  "attestation": {
+    "mode": "stub-hmac-sha256",
+    "signerKeyId": "dev-attestor-v1",
+    "signingKeyHex": null,
+    "signingKeySecretName": "secure-settle-attestation-signing-key",
+    "devFallbackSigningKeyHex": null,
+    "expectedMeasurement": "secure-settle/confidential-stub/v1",
+    "allowedMeasurements": [
+      "secure-settle/confidential-stub/v1"
+    ],
+    "trustedSignerKeyIds": [
+      "dev-attestor-v1"
+    ],
+    "trustedCertFingerprintsSha256": [],
+    "maxAgeSeconds": 300,
+    "requireVerification": true
+  },
+  "storage": {
+    "provider": "local-file",
+    "dataPath": "../.local/secure-settle-store.json"
+  },
+  "demo": {
+    "seedOnEmpty": true,
+    "clockSkewToleranceSeconds": 5,
+    "allowBootstrapAdapters": true
+  }
+}
