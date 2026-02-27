@@ -5,11 +5,6 @@
   "type": "module",
   "scripts": {
     "postinstall": "bunx cre-setup",
-    "simulate": "bun run simulate.ts",
-    "seed": "bun run simulate.ts --seed-only",
-    "ingest": "bun run ingest.ts",
-    "status": "bun run status.ts",
-    "balances-typed-data": "bun run balances-typed-data.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
@@ -17,7 +12,6 @@
     "zod": "^4.1.12"
   },
   "devDependencies": {
-    "@types/node": "^22.10.2",
     "typescript": "^5.7.2"
   }
 }

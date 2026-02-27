@@ -1,0 +1,7 @@
+node_modules/
+.DS_Store
+
+# CRE workflow local state/secrets
+cre-workflow/secrets.yaml
+cre-workflow/.local/
+

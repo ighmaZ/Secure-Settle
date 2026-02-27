@@ -1,8 +1,3 @@
-# ==========================================================================
-# CRE WORKFLOW SETTINGS FILE
-# ==========================================================================
-# Workflow-specific settings for CRE CLI targets.
-
 local-simulation:
   user-workflow:
     workflow-name: "secure-settle-otc"
@@ -18,4 +13,3 @@ staging:
     workflow-path: "./main.ts"
     config-path: "./config.json"
     secrets-path: "../secrets.yaml"
-
