@@ -1,40 +1,83 @@
 # SecureSettle CRE Workflow
 
-CRE-first workflow scaffold for SecureSettle OTC matching, adapted from the Chainlink GCP prediction market demo structure.
+This folder contains the CRE-first backend for SecureSettle OTC matching.
 
-## Local simulation (stubbed confidential compute)
+## What exists now
 
-1. `cd /Users/ighmaz/SecureSettle/cre-workflow/secure-settle-otc`
-2. `bun install`
-3. `bun run simulate`
+- One CRE workflow: `/Users/ighmaz/SecureSettle/cre-workflow/secure-settle-otc`
+- Two triggers:
+  - `cron` trigger: scans proposals and runs matching cycles
+  - `http` trigger: accepts proposal batches directly and evaluates them
+- Confidential external calls use `ConfidentialHTTPClient`:
+  - proposal source fetch (`proposalSourceUrl`)
+  - benchmark fetch (`benchmarkUrl`)
+  - result sink post (`resultSinkUrl`)
 
-This seeds demo proposals into `cre-workflow/.local/secure-settle-store.json` and runs one cron-style matching cycle.
+## Privacy model in this version
 
-## EIP-712 `/balances` auth payload (for live Convergence position checks)
+- API calls are made via CRE Confidential HTTP capability.
+- Optional secret-backed Authorization header is injected using vault secrets (`vaultDonSecrets` + `{{.secretKey}}` template).
+- Workflow logs are redacted-by-design:
+  - logs only counts/status
+  - does not log raw proposal JSON payloads
 
-- Generate typed data for MetaMask signing:
-  - `bun run balances-typed-data <seller-wallet-address>`
-- Sign the JSON with `eth_signTypedData_v4`
-- Include the resulting signed request payload in the seller proposal under `convergenceBalancesAuth`:
-  - `{ "account": "...", "timestamp": 1234567890, "auth": "0x<signature>" }`
+## Current workflow logic
 
+1. Load proposals (from confidential source URL or local fallback fixture).
+2. Pair BUY and SELL proposals for same asset and settlement token.
+3. Run checks:
+   - sanctions list check
+   - AML notional threshold check
+   - quantity compatibility
+   - price tolerance
+   - optional benchmark deviation check
+4. Emit decisions:
+   - `MATCH`
+   - `NO_MATCH`
+   - `REJECTED_COMPLIANCE`
+5. Post the result set to `resultSinkUrl` through Confidential HTTP (if configured).
 
-## What is intentionally stubbed
+## Configuration
 
-- Durable CRE runtime persistence and production capability wiring (the entrypoint exists, but uses bootstrap in-memory store and stub/live-toggle adapters)
-- Real Confidential Compute / TEE integration
-- Real Convergence API HTTP calls with EIP-712 signed payloads (`/balances`, `/transactions`, `/private-transfer`, `/withdraw`, `/shielded-address`)
-- Settlement transaction writes
+Main file: `/Users/ighmaz/SecureSettle/cre-workflow/secure-settle-otc/config.json`
 
-## CRE runtime modes (current scaffold)
+Important fields:
 
-`/Users/ighmaz/SecureSettle/cre-workflow/secure-settle-otc/config.json` now supports:
+- `proposalSourceUrl`, `benchmarkUrl`, `resultSinkUrl`
+  - must be `https://` for non-local endpoints
+- `authHeaderSecretKey`
+  - if set, adds header `Authorization: Bearer {{.<authHeaderSecretKey>}}`
+- `owner`, `secretNamespace`
+  - optional vault secret scope controls
+- `encryptResultSinkResponse`
+  - enables confidential output encryption for result sink call
 
-- `convergence.mode`: `stub | live`
-- `confidentialCompute.mode`: `stub | http`
+## Secrets
+
+- File: `/Users/ighmaz/SecureSettle/cre-workflow/secrets.yaml`
+- Example template: `/Users/ighmaz/SecureSettle/cre-workflow/secrets.yaml.example`
+- For this Convergence hackathon flow, no API key is required by default.
+- If you add a bearer token later, put it in `secrets.yaml` and reference its key name in `authHeaderSecretKey`.
+
+## Local validation
+
+From `/Users/ighmaz/SecureSettle/cre-workflow/secure-settle-otc`:
+
+```bash
+bun install
+bun run typecheck
+```
+
+## CRE simulation
+
+From `/Users/ighmaz/SecureSettle/cre-workflow/secure-settle-otc`:
+
+```bash
+bunx cre workflow simulate secure-settle-otc --target local-simulation
+```
 
 Notes:
-- `convergence.mode=live` uses CRE HTTP capability calls to `POST /balances` (requires seller-signed `convergenceBalancesAuth` in the proposal payload).
-- `confidentialCompute.mode=http` calls a configured endpoint (`confidentialCompute.endpointUrl`) and expects a response matching the internal `AttestedMatchResult` schema.
-- The workflow still uses an in-memory store in CRE runtime mode (by design for now); durable persistence is not yet implemented.
-- `demo.allowBootstrapAdapters` must be `true` to run the current CRE entrypoint with bootstrap adapters. Set it to `false` to fail closed until durable persistence / real adapters are wired.
+
+- CRE CLI login is required (`cre login`).
+- In restricted/offline environments, simulation may fail during auth/token refresh.
+- Typecheck can still be used as the first gating check when simulation is blocked.

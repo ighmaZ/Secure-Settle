@@ -1,10 +1,11 @@
 import {
-  consensusIdenticalAggregation,
   cre,
+  json as readJsonBody,
+  ok as isHttpOk,
   Runner,
+  text as readTextBody,
   type CronPayload,
   type HTTPPayload,
-  HTTPSendRequester,
   type Runtime
 } from "@chainlink/cre-sdk";
 import { z } from "zod";
@@ -15,8 +16,10 @@ const configSchema = z.object({
   proposalSourceUrl: z.string().url().nullable(),
   benchmarkUrl: z.string().url().nullable(),
   resultSinkUrl: z.string().url().nullable(),
-  authHeaderSecretName: z.string().min(1).nullable(),
-  httpTimeoutMs: z.number().int().positive().default(5000),
+  owner: z.string().min(1).nullable().default(null),
+  secretNamespace: z.string().min(1).nullable().default(null),
+  authHeaderSecretKey: z.string().min(1).nullable().default(null),
+  encryptResultSinkResponse: z.boolean().default(false),
   priceToleranceBps: z.number().int().min(0).max(10000),
   requireExactQuantity: z.boolean().default(true),
   amlNotionalThreshold: z.number().positive(),
@@ -62,21 +65,31 @@ type MatchResult = {
   evaluatedAt: string;
 };
 
-type PostResponse = {
+type JsonResponse = {
   statusCode: number;
+  body: unknown;
 };
 
-type JsonRequest = {
+type ConfidentialHttpResponse = ReturnType<
+  ReturnType<
+    InstanceType<typeof cre.capabilities.ConfidentialHTTPClient>["sendRequest"]
+  >["result"]
+>;
+
+type ConfidentialRequest = {
   url: string;
   method: "GET" | "POST";
   headers?: Record<string, string>;
   body?: unknown;
-  timeoutMs: number;
+  encryptOutput?: boolean;
 };
 
-type JsonResponse = {
-  statusCode: number;
-  body: unknown;
+type WorkflowSummary = {
+  totalCandidates: number;
+  matches: number;
+  rejectedCompliance: number;
+  noMatch: number;
+  postStatusCode: number;
 };
 
 const benchmarkResponseSchema = z.object({
@@ -84,6 +97,7 @@ const benchmarkResponseSchema = z.object({
   referencePrice: z.number().positive(),
   asOf: z.string().datetime()
 });
+
 const matchResultSchema: z.ZodType<MatchResult> = z.object({
   candidateId: z.string().min(1),
   buyProposalId: z.string().min(1),
@@ -97,61 +111,21 @@ const matchResultSchema: z.ZodType<MatchResult> = z.object({
   evaluatedAt: z.string().datetime()
 });
 
-const encodeUtf8AsBase64 = (value: string): string => {
-  const bytes = new TextEncoder().encode(value);
-  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-  let output = "";
-  let index = 0;
-  while (index < bytes.length) {
-    const byte0 = bytes[index++] ?? 0;
-    const byte1 = bytes[index++] ?? 0;
-    const byte2 = bytes[index++] ?? 0;
-
-    const triplet = (byte0 << 16) | (byte1 << 8) | byte2;
-    output += alphabet[(triplet >> 18) & 0x3f];
-    output += alphabet[(triplet >> 12) & 0x3f];
-    output += alphabet[(triplet >> 6) & 0x3f];
-    output += alphabet[triplet & 0x3f];
-  }
-
-  const remainder = bytes.length % 3;
-  if (remainder === 1) return `${output.slice(0, -2)}==`;
-  if (remainder === 2) return `${output.slice(0, -1)}=`;
-  return output;
-};
-
-const parseResponseBody = (rawBody: Uint8Array): unknown => {
-  const asText = new TextDecoder().decode(rawBody);
-  if (!asText) return null;
-  try {
-    return JSON.parse(asText);
-  } catch {
-    return asText;
-  }
-};
-
-const sendJsonRequest = (
-  sendRequester: HTTPSendRequester,
-  request: JsonRequest
-): string => {
-  const resp = sendRequester
-    .sendRequest({
-      url: request.url,
-      method: request.method,
-      body: request.body === undefined ? "" : encodeUtf8AsBase64(JSON.stringify(request.body)),
-      headers: request.headers ?? {},
-      timeoutMs: request.timeoutMs
-    })
-    .result();
-
-  return JSON.stringify({
-    statusCode: resp.statusCode,
-    body: parseResponseBody(resp.body)
-  });
-};
-
 const normalizeWallet = (address: string) => address.toLowerCase();
+
+const isLocalAddress = (url: URL) =>
+  url.hostname === "localhost" ||
+  url.hostname === "127.0.0.1" ||
+  url.hostname === "::1" ||
+  url.hostname.endsWith(".local");
+
+const assertSecureRemoteUrl = (rawUrl: string | null, fieldName: string): void => {
+  if (!rawUrl) return;
+  const parsed = new URL(rawUrl);
+  if (parsed.protocol !== "https:" && !isLocalAddress(parsed)) {
+    throw new Error(`${fieldName} must use https for non-local endpoints`);
+  }
+};
 
 const isSanctioned = (config: Config, walletAddress: string): boolean => {
   const normalized = normalizeWallet(walletAddress);
@@ -225,6 +199,7 @@ const evaluateCandidate = (
   const quantityCompatible = config.requireExactQuantity
     ? buy.quantity === sell.quantity
     : matchedQuantity > 0;
+
   if (!quantityCompatible) {
     return matchResultSchema.parse({
       candidateId,
@@ -282,119 +257,168 @@ const evaluateCandidate = (
   });
 };
 
-const getAuthHeader = (runtime: Runtime<Config>): string | undefined => {
-  if (!runtime.config.authHeaderSecretName) return undefined;
+function buildConfidentialHeaders(config: Config, headers?: Record<string, string>) {
+  const multiHeaders: Record<string, { values: string[] }> = {};
 
-  const secret = runtime.getSecret({ id: runtime.config.authHeaderSecretName }).result();
-  if (!secret.value) {
-    throw new Error(`Secret '${runtime.config.authHeaderSecretName}' is empty`);
+  if (headers) {
+    for (const [key, value] of Object.entries(headers)) {
+      multiHeaders[key] = { values: [value] };
+    }
   }
 
-  return secret.value;
-};
+  if (config.authHeaderSecretKey) {
+    multiHeaders.authorization = {
+      values: [`Bearer {{.${config.authHeaderSecretKey}}}`]
+    };
+  }
 
-const fetchProposals = (
+  return multiHeaders;
+}
+
+function buildVaultDonSecrets(config: Config) {
+  if (!config.authHeaderSecretKey) {
+    return [];
+  }
+
+  return [
+    {
+      key: config.authHeaderSecretKey,
+      owner: config.owner ?? undefined,
+      namespace: config.secretNamespace ?? undefined
+    }
+  ];
+}
+
+function parseConfidentialResponse(
+  response: ConfidentialHttpResponse,
+  decryptExpected: boolean
+): JsonResponse {
+  if (!isHttpOk(response)) {
+    throw new Error(`Confidential HTTP request failed with status ${response.statusCode}`);
+  }
+
+  if (decryptExpected) {
+    return {
+      statusCode: response.statusCode,
+      body: readTextBody(response)
+    };
+  }
+
+  try {
+    return {
+      statusCode: response.statusCode,
+      body: readJsonBody(response)
+    };
+  } catch {
+    return {
+      statusCode: response.statusCode,
+      body: readTextBody(response)
+    };
+  }
+}
+
+function confidentialJsonRequest(
   runtime: Runtime<Config>,
-  authHeader: string | undefined
-): Proposal[] => {
+  request: ConfidentialRequest
+): JsonResponse {
+  const client = new cre.capabilities.ConfidentialHTTPClient();
+  const response = client
+    .sendRequest(runtime, {
+      vaultDonSecrets: buildVaultDonSecrets(runtime.config),
+      request: {
+        url: request.url,
+        method: request.method,
+        ...(request.body === undefined ? {} : { bodyString: JSON.stringify(request.body) }),
+        multiHeaders: buildConfidentialHeaders(runtime.config, request.headers),
+        encryptOutput: request.encryptOutput ?? false
+      }
+    })
+    .result();
+
+  return parseConfidentialResponse(response, request.encryptOutput ?? false);
+}
+
+const fetchProposals = (runtime: Runtime<Config>): Proposal[] => {
   if (!runtime.config.proposalSourceUrl) {
     runtime.log(`Using fallback proposals count=${runtime.config.fallbackProposals.length}`);
     return runtime.config.fallbackProposals;
   }
 
-  const httpClient = new cre.capabilities.HTTPClient();
-  const response = httpClient
-    .sendRequest(runtime, sendJsonRequest, consensusIdenticalAggregation<string>())({
+  try {
+    const response = confidentialJsonRequest(runtime, {
       url: runtime.config.proposalSourceUrl,
-      method: "GET",
-      headers: authHeader ? { authorization: authHeader } : undefined,
-      timeoutMs: runtime.config.httpTimeoutMs
-    })
-    .result();
-  const parsedResponse = JSON.parse(response) as JsonResponse;
+      method: "GET"
+    });
 
-  if (parsedResponse.statusCode < 200 || parsedResponse.statusCode >= 300) {
-    throw new Error(`Proposal source request failed with status ${parsedResponse.statusCode}`);
+    const payload = response.body;
+    const rawProposals =
+      Array.isArray(payload) ? payload : (payload as { proposals?: unknown[] })?.proposals ?? [];
+
+    return rawProposals.map((item) => proposalSchema.parse(item));
+  } catch (error) {
+    runtime.log(`Proposal source unavailable, using fallback proposals: ${String(error)}`);
+    return runtime.config.fallbackProposals;
   }
-
-  const payload = parsedResponse.body;
-  const rawProposals =
-    Array.isArray(payload) ? payload : (payload as { proposals?: unknown[] })?.proposals ?? [];
-
-  return rawProposals.map((item) => proposalSchema.parse(item));
 };
 
-const fetchBenchmarkPrice = (
-  runtime: Runtime<Config>,
-  authHeader: string | undefined,
-  assetId: string
-): number | null => {
+const fetchBenchmarkPrice = (runtime: Runtime<Config>, assetId: string): number | null => {
   if (!runtime.config.benchmarkUrl) {
     return null;
   }
 
-  const url = new URL(runtime.config.benchmarkUrl);
-  url.searchParams.set("assetId", assetId);
+  try {
+    const url = new URL(runtime.config.benchmarkUrl);
+    url.searchParams.set("assetId", assetId);
 
-  const httpClient = new cre.capabilities.HTTPClient();
-  const response = httpClient
-    .sendRequest(runtime, sendJsonRequest, consensusIdenticalAggregation<string>())({
+    const response = confidentialJsonRequest(runtime, {
       url: url.toString(),
-      method: "GET",
-      headers: authHeader ? { authorization: authHeader } : undefined,
-      timeoutMs: runtime.config.httpTimeoutMs
-    })
-    .result();
-  const parsedResponse = JSON.parse(response) as JsonResponse;
+      method: "GET"
+    });
 
-  if (parsedResponse.statusCode < 200 || parsedResponse.statusCode >= 300) {
+    return benchmarkResponseSchema.parse(response.body).referencePrice;
+  } catch (error) {
+    runtime.log(`Benchmark fetch failed for assetId=${assetId}: ${String(error)}`);
     return null;
   }
-
-  return benchmarkResponseSchema.parse(parsedResponse.body).referencePrice;
 };
 
-const postResults = (
-  runtime: Runtime<Config>,
-  authHeader: string | undefined,
-  results: MatchResult[]
-): PostResponse => {
+const postResults = (runtime: Runtime<Config>, results: MatchResult[]): number => {
   if (!runtime.config.resultSinkUrl || results.length === 0) {
-    return { statusCode: 204 };
+    return 204;
   }
 
-  const httpClient = new cre.capabilities.HTTPClient();
-  const response = httpClient
-    .sendRequest(runtime, sendJsonRequest, consensusIdenticalAggregation<string>())({
+  try {
+    const response = confidentialJsonRequest(runtime, {
       url: runtime.config.resultSinkUrl,
       method: "POST",
       headers: {
-        "content-type": "application/json",
-        ...(authHeader ? { authorization: authHeader } : {})
+        "content-type": "application/json"
       },
       body: {
         workflowId: runtime.config.workflowId,
         results
       },
-      timeoutMs: runtime.config.httpTimeoutMs
-    })
-    .result();
-  const parsedResponse = JSON.parse(response) as JsonResponse;
-  return { statusCode: parsedResponse.statusCode };
+      encryptOutput: runtime.config.encryptResultSinkResponse
+    });
+
+    return response.statusCode;
+  } catch (error) {
+    runtime.log(`Result sink request failed: ${String(error)}`);
+    return 503;
+  }
 };
 
 const evaluateProposals = (
   runtime: Runtime<Config>,
   proposals: Proposal[],
-  evaluatedAt: string,
-  authHeader: string | undefined
+  evaluatedAt: string
 ): MatchResult[] => {
   const candidates = findCandidates(proposals);
   runtime.log(`Candidate count=${candidates.length}`);
 
   const results: MatchResult[] = [];
   for (const candidate of candidates) {
-    const benchmarkPrice = fetchBenchmarkPrice(runtime, authHeader, candidate.buy.assetId);
+    const benchmarkPrice = fetchBenchmarkPrice(runtime, candidate.buy.assetId);
     const result = evaluateCandidate(
       runtime.config,
       candidate.buy,
@@ -423,48 +447,48 @@ const runMatchingCycle = (
   proposals: Proposal[],
   evaluatedAt: string
 ): MatchResult[] => {
-  const authHeader = getAuthHeader(runtime);
-  const results = evaluateProposals(runtime, proposals, evaluatedAt, authHeader);
-  const postResult = postResults(runtime, authHeader, results);
-
-  runtime.log(`Posted results status=${postResult.statusCode}`);
+  const results = evaluateProposals(runtime, proposals, evaluatedAt);
+  const statusCode = postResults(runtime, results);
+  runtime.log(`Posted results status=${statusCode}`);
   return results;
+};
+
+const summarizeResults = (results: MatchResult[], postStatusCode: number): WorkflowSummary => ({
+  totalCandidates: results.length,
+  matches: results.filter((result) => result.decision === "MATCH").length,
+  rejectedCompliance: results.filter((result) => result.decision === "REJECTED_COMPLIANCE").length,
+  noMatch: results.filter((result) => result.decision === "NO_MATCH").length,
+  postStatusCode
+});
+
+const parseHttpTriggerPayload = (payload: HTTPPayload): Proposal[] => {
+  if (!payload.input || payload.input.length === 0) {
+    throw new Error("HTTP trigger payload is empty");
+  }
+
+  const rawText = new TextDecoder().decode(payload.input);
+  const parsed = JSON.parse(rawText) as { proposals?: unknown[] };
+  return (parsed.proposals ?? []).map((proposal) => proposalSchema.parse(proposal));
 };
 
 const onCronTrigger = (runtime: Runtime<Config>, payload: CronPayload): string => {
   const evaluatedAt = cronPayloadToIsoTime(payload, runtime);
-  const authHeader = getAuthHeader(runtime);
-  const proposals = fetchProposals(runtime, authHeader);
+  const proposals = fetchProposals(runtime);
 
   runtime.log(`Fetched proposals count=${proposals.length}`);
 
-  const results = evaluateProposals(runtime, proposals, evaluatedAt, authHeader);
-  const postResult = postResults(runtime, authHeader, results);
-
-  const summary = {
-    totalCandidates: results.length,
-    matches: results.filter((result) => result.decision === "MATCH").length,
-    rejectedCompliance: results.filter((result) => result.decision === "REJECTED_COMPLIANCE").length,
-    noMatch: results.filter((result) => result.decision === "NO_MATCH").length,
-    postStatusCode: postResult.statusCode
-  };
+  const results = evaluateProposals(runtime, proposals, evaluatedAt);
+  const statusCode = postResults(runtime, results);
+  const summary = summarizeResults(results, statusCode);
 
   runtime.log(`Cycle complete ${JSON.stringify(summary)}`);
   return `Processed ${summary.totalCandidates} candidate(s), ${summary.matches} matched`;
 };
 
 const onHTTPTrigger = (runtime: Runtime<Config>, payload: HTTPPayload): string => {
-  runtime.log("Raw HTTP trigger received");
-
-  if (!payload.input || payload.input.length === 0) {
-    throw new Error("HTTP trigger payload is empty");
-  }
-
-  const rawText = new TextDecoder().decode(payload.input);
-  runtime.log(`Payload bytes payloadBytes ${rawText}`);
-
-  const parsed = JSON.parse(rawText) as { proposals?: unknown[] };
-  const proposals = (parsed.proposals ?? []).map((proposal) => proposalSchema.parse(proposal));
+  runtime.log("HTTP trigger received");
+  runtime.log(`Payload size bytes=${payload.input?.length ?? 0}`);
+  const proposals = parseHttpTriggerPayload(payload);
 
   const evaluatedAt = runtime.now().toISOString();
   const results = runMatchingCycle(runtime, proposals, evaluatedAt);
@@ -473,6 +497,10 @@ const onHTTPTrigger = (runtime: Runtime<Config>, payload: HTTPPayload): string =
 };
 
 const initWorkflow = (config: Config) => {
+  assertSecureRemoteUrl(config.proposalSourceUrl, "proposalSourceUrl");
+  assertSecureRemoteUrl(config.benchmarkUrl, "benchmarkUrl");
+  assertSecureRemoteUrl(config.resultSinkUrl, "resultSinkUrl");
+
   const cronCapability = new cre.capabilities.CronCapability();
   const httpTrigger = new cre.capabilities.HTTPCapability();
 
